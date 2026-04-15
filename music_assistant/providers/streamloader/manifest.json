@@ -1,0 +1,11 @@
+{
+  "type": "music",
+  "domain": "streamloader",
+  "stage": "experimental",
+  "name": "Streamloader",
+  "description": "Provider for a standalone streamloader backend that federates upstream acquisition (monochrome / qqdl / squid mirrors), manages an on-disk FLAC library, and exposes it to Music Assistant for browse, search, and playback.",
+  "codeowners": ["@konradwalsh"],
+  "requirements": [],
+  "documentation": "https://github.com/konradwalsh/msserver-streamloader",
+  "multi_instance": false
+}
