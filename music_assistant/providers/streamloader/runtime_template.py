@@ -1587,12 +1587,38 @@ class StreamloaderMAProvider(MusicProviderBase):
     async def get_similar_tracks(self, prov_track_id: str, limit: int = 25) -> list[Any]:
         """Return tracks similar to ``prov_track_id``.
 
-        Enables MA's "Don't stop the music" feature. Streamloader has no
-        upstream similarity endpoint today, so we approximate by returning
-        more tracks from the same artist via the existing
-        :meth:`get_artist_toptracks` path. If the current track's artist
-        cannot be resolved we return an empty list rather than guessing.
+        Enables MA's "Don't stop the music" feature. Two strategies, in order:
+
+        1. Ask streamloader's ``/api/track/similar`` endpoint, which drives
+           Tidal's TRACK_MIX for cross-artist radio-style recommendations.
+        2. Fall back to "more from the same artist" via
+           :meth:`get_artist_toptracks` when the upstream mix is unavailable
+           (e.g. the track has no mix id, or the upstream rate-limits us).
         """
+        decoded_track_id = self._adapter.decode_provider_id(prov_track_id)
+
+        # 1. Try the upstream TRACK_MIX via streamloader.
+        if decoded_track_id and "://track/" in decoded_track_id:
+            try:
+                upstream_items = await self._provider.client.similar_tracks(
+                    decoded_track_id, limit=max(1, int(limit) or 25)
+                )
+            except Exception:
+                upstream_items = []
+            mapped_upstream: list[Any] = []
+            for item in upstream_items:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    mapped_upstream.append(
+                        self._adapter._to_ma_object("track", self._adapter._map_track_item(item))
+                    )
+                except Exception:
+                    continue
+            if mapped_upstream:
+                return mapped_upstream[: max(1, int(limit) or 25)]
+
+        # 2. Fallback: resolve the track's artist and return more of their tracks.
         try:
             track = await self.get_track(prov_track_id)
         except Exception as exc:

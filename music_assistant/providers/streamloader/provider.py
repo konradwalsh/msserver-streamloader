@@ -184,6 +184,16 @@ class StreamloaderClient:
     async def track(self, track_id: str) -> dict[str, Any]:
         return await self._request_json("GET", "/api/track", params={"track_id": track_id})
 
+    async def similar_tracks(self, track_id: str, limit: int = 25) -> list[dict[str, Any]]:
+        payload = await self._request_json(
+            "GET",
+            "/api/track/similar",
+            params={"track_id": track_id, "limit": max(1, min(int(limit or 25), 100))},
+        )
+        if isinstance(payload, list):
+            return [item for item in payload if isinstance(item, dict)]
+        return []
+
     async def artist(self, artist_id: str, artist_name: str | None = None) -> dict[str, Any]:
         params: dict[str, Any] = {"artist_id": artist_id}
         if artist_name:
