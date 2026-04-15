@@ -1584,24 +1584,94 @@ class StreamloaderMAProvider(MusicProviderBase):
             for item in filtered[: max(10, self._default_search_limit * 2)]
         ]
 
+    async def _resolve_library_track_to_upstream(self, prov_track_id: str) -> str:
+        """Find a ``monochrome://track/...`` id that matches a library track.
+
+        Used by :meth:`get_similar_tracks` so local FLAC tracks can reach the
+        upstream TRACK_MIX recommender. We take the track's artist and title,
+        ask the streamloader backend for a search, then prefer an exact
+        case-insensitive ``artist`` + ``title`` hit. Returns an empty string
+        if no confident match is found (caller falls back to artist toptracks).
+        """
+        try:
+            track = await self.get_track(prov_track_id)
+        except Exception:
+            return ""
+
+        if isinstance(track, dict):
+            artist_name = str(track.get("artist") or track.get("artist_name") or "").strip()
+            track_name = str(track.get("name") or "").strip()
+        else:
+            track_name = str(getattr(track, "name", "") or "").strip()
+            artist_name = str(getattr(track, "artist_name", "") or "").strip()
+            if not artist_name:
+                candidates = list(getattr(track, "artists", []) or [])
+                if candidates:
+                    first = candidates[0]
+                    artist_name = str(
+                        first.get("name") if isinstance(first, dict) else getattr(first, "name", "")
+                    ).strip()
+
+        # Filename often carries a leading "NN - " or "NN. " that is not part of the title.
+        if track_name:
+            track_name = re.sub(r"^\s*\d{1,3}\s*[-.\u2013]\s*", "", track_name).strip()
+
+        if not artist_name or not track_name:
+            return ""
+
+        query = f"{artist_name} {track_name}"
+        try:
+            search = await self._adapter.mapped_search(query)
+        except Exception:
+            return ""
+
+        target_name = track_name.lower()
+        target_artist = artist_name.lower()
+        for candidate in search.tracks:
+            if not isinstance(candidate, dict):
+                continue
+            cand_name = str(candidate.get("name") or "").strip().lower()
+            cand_artist = str(candidate.get("artist") or "").strip().lower()
+            cand_id = str(candidate.get("item_id") or "").strip()
+            if not cand_id:
+                continue
+            if cand_name == target_name and cand_artist == target_artist:
+                decoded = self._adapter.decode_provider_id(cand_id)
+                if decoded.startswith("monochrome://track/"):
+                    return decoded
+        return ""
+
     async def get_similar_tracks(self, prov_track_id: str, limit: int = 25) -> list[Any]:
         """Return tracks similar to ``prov_track_id``.
 
-        Enables MA's "Don't stop the music" feature. Two strategies, in order:
+        Enables MA's "Don't stop the music" feature. Three strategies, tried
+        in order until one produces results:
 
-        1. Ask streamloader's ``/api/track/similar`` endpoint, which drives
-           Tidal's TRACK_MIX for cross-artist radio-style recommendations.
-        2. Fall back to "more from the same artist" via
-           :meth:`get_artist_toptracks` when the upstream mix is unavailable
-           (e.g. the track has no mix id, or the upstream rate-limits us).
+        1. If the seed is a ``monochrome://track/...`` URI, ask streamloader's
+           ``/api/track/similar`` for Tidal's TRACK_MIX directly.
+        2. If the seed is a ``library:...`` URI (on-disk FLAC), resolve it to
+           a monochrome track id by searching upstream for ``<artist> <title>``
+           and picking a confident match, then ask TRACK_MIX for that id.
+        3. Fall back to "more from the same artist" via
+           :meth:`get_artist_toptracks` when no upstream match is available.
         """
         decoded_track_id = self._adapter.decode_provider_id(prov_track_id)
+        desired = max(1, int(limit) or 25)
 
-        # 1. Try the upstream TRACK_MIX via streamloader.
+        # Determine the upstream (monochrome) track id we should query the mix for.
+        upstream_track_id = ""
         if decoded_track_id and "://track/" in decoded_track_id:
+            upstream_track_id = decoded_track_id
+        elif decoded_track_id and (
+            decoded_track_id.startswith("library:") or decoded_track_id.startswith("library/")
+        ):
+            upstream_track_id = await self._resolve_library_track_to_upstream(prov_track_id)
+
+        # 1+2. If we have an upstream id, fetch TRACK_MIX-based similar tracks.
+        if upstream_track_id:
             try:
                 upstream_items = await self._provider.client.similar_tracks(
-                    decoded_track_id, limit=max(1, int(limit) or 25)
+                    upstream_track_id, limit=desired
                 )
             except Exception:
                 upstream_items = []
@@ -1616,7 +1686,7 @@ class StreamloaderMAProvider(MusicProviderBase):
                 except Exception:
                     continue
             if mapped_upstream:
-                return mapped_upstream[: max(1, int(limit) or 25)]
+                return mapped_upstream[:desired]
 
         # 2. Fallback: resolve the track's artist and return more of their tracks.
         try:
