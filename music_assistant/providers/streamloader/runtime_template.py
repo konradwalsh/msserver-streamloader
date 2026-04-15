@@ -567,6 +567,7 @@ class StreamloaderMAProvider(MusicProviderBase):
                 "ARTIST_ALBUMS",
                 "ARTIST_TOPTRACKS",
                 "ALBUM_TRACKS",
+                "SIMILAR_TRACKS",
             ):
                 feature = getattr(ProviderFeature, feature_name, None)
                 if feature is not None:
@@ -1582,6 +1583,69 @@ class StreamloaderMAProvider(MusicProviderBase):
             self._adapter._to_ma_object("track", self._adapter._map_track_item(item))
             for item in filtered[: max(10, self._default_search_limit * 2)]
         ]
+
+    async def get_similar_tracks(self, prov_track_id: str, limit: int = 25) -> list[Any]:
+        """Return tracks similar to ``prov_track_id``.
+
+        Enables MA's "Don't stop the music" feature. Streamloader has no
+        upstream similarity endpoint today, so we approximate by returning
+        more tracks from the same artist via the existing
+        :meth:`get_artist_toptracks` path. If the current track's artist
+        cannot be resolved we return an empty list rather than guessing.
+        """
+        try:
+            track = await self.get_track(prov_track_id)
+        except Exception as exc:
+            self._raise_unavailable(exc, "similar tracks: track lookup")
+            return []
+
+        artist_id = ""
+        artist_name = ""
+        if isinstance(track, dict):
+            artist_id = str(track.get("artist_id") or "").strip()
+            artist_name = str(track.get("artist") or track.get("artist_name") or "").strip()
+        else:
+            candidates = list(getattr(track, "artists", []) or [])
+            if candidates:
+                first = candidates[0]
+                if isinstance(first, dict):
+                    artist_id = str(first.get("item_id") or "").strip()
+                    artist_name = str(first.get("name") or "").strip()
+                else:
+                    artist_id = str(getattr(first, "item_id", "") or "").strip()
+                    artist_name = str(getattr(first, "name", "") or "").strip()
+            if not artist_name:
+                artist_name = str(getattr(track, "artist_name", "") or "").strip()
+
+        if not artist_id and artist_name:
+            # Best-effort local resolution if the track only exposes a name.
+            artist_id = self._local_artist_id(artist_name)
+        if not artist_id:
+            return []
+
+        try:
+            tracks = await self.get_artist_toptracks(artist_id)
+        except Exception as exc:
+            self._raise_unavailable(exc, "similar tracks: artist toptracks")
+            return []
+
+        decoded_origin = self._adapter.decode_provider_id(prov_track_id)
+        result: list[Any] = []
+        for entry in tracks:
+            entry_id = ""
+            if isinstance(entry, dict):
+                entry_id = str(entry.get("item_id") or "").strip()
+            else:
+                entry_id = str(getattr(entry, "item_id", "") or "").strip()
+            if entry_id and (
+                entry_id == str(prov_track_id)
+                or self._adapter.decode_provider_id(entry_id) == decoded_origin
+            ):
+                continue
+            result.append(entry)
+            if len(result) >= max(1, int(limit) or 25):
+                break
+        return result
 
     async def get_album(self, prov_album_id: str) -> Any:
         decoded_album_id = self._adapter.decode_provider_id(prov_album_id)
