@@ -7,6 +7,7 @@ developed/tested outside MA and dropped into a running MA instance.
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import AsyncGenerator
 from typing import Any
 from urllib.parse import quote, unquote, unquote_plus
