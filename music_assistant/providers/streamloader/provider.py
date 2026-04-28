@@ -251,7 +251,13 @@ class StreamloaderClient:
 
     def library_stream_url(self, relative_path: str) -> str:
         encoded_path = quote(relative_path.strip("/"), safe="/")
-        return f"{self._stream_base_url()}/api/library/stream/{encoded_path}"
+        url = f"{self._stream_base_url()}/api/library/stream/{encoded_path}"
+        if self._api_key:
+            # Stream URLs are handed to ffmpeg / MA's stream pipeline directly,
+            # which won't carry our Authorization header. Backend's
+            # _extract_supplied_key accepts ?api_key= as a fallback.
+            url = f"{url}?api_key={quote(self._api_key, safe='')}"
+        return url
 
 
 class StreamloaderMusicProvider:
