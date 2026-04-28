@@ -252,12 +252,23 @@ class StreamloaderClient:
     def library_stream_url(self, relative_path: str) -> str:
         encoded_path = quote(relative_path.strip("/"), safe="/")
         url = f"{self._stream_base_url()}/api/library/stream/{encoded_path}"
-        if self._api_key:
-            # Stream URLs are handed to ffmpeg / MA's stream pipeline directly,
-            # which won't carry our Authorization header. Backend's
-            # _extract_supplied_key accepts ?api_key= as a fallback.
-            url = f"{url}?api_key={quote(self._api_key, safe='')}"
-        return url
+        return self._with_api_key(url)
+
+    def library_art_url(self, relative_path: str, *, artist_level: bool = False) -> str:
+        encoded_path = quote(relative_path.strip("/"), safe="/")
+        filename = "artist.jpg" if artist_level else "cover.jpg"
+        url = f"{self._stream_base_url()}/api/library/art/{encoded_path}/{filename}"
+        return self._with_api_key(url)
+
+    def _with_api_key(self, url: str) -> str:
+        # Stream / art URLs are handed to ffmpeg / MA's image pipeline /
+        # the frontend directly, none of which carry our Authorization
+        # header. Backend's _extract_supplied_key accepts ?api_key= as
+        # a fallback for exactly this case.
+        if not self._api_key:
+            return url
+        sep = "&" if "?" in url else "?"
+        return f"{url}{sep}api_key={quote(self._api_key, safe='')}"
 
 
 class StreamloaderMusicProvider:
@@ -349,10 +360,7 @@ class StreamloaderMusicProvider:
         return self.client.library_stream_url(relative_path)
 
     async def get_library_art_url(self, relative_path: str, *, artist_level: bool = False) -> str:
-        encoded_path = quote(relative_path.strip("/"), safe="/")
-        filename = "artist.jpg" if artist_level else "cover.jpg"
-        base = self.client._stream_base_url()
-        return f"{base}/api/library/art/{encoded_path}/{filename}"
+        return self.client.library_art_url(relative_path, artist_level=artist_level)
 
 
 @dataclass
