@@ -25,6 +25,13 @@ _LOGGER = logging.getLogger(__name__)
 _LRU_MAX = 256
 _CACHE_TTL_SECONDS = 300
 
+# MA's placeholder string that replaces SECURE_STRING values in serialized
+# config payloads. If a previous (buggy) save round-tripped the placeholder
+# through Config.update(), the stored encrypted blob now decrypts back to
+# this literal -- so we must treat it as "no key set" rather than send it
+# upstream as an api_key.
+_SECURE_STRING_PLACEHOLDER = "this_value_is_encrypted"
+
 
 def _import_music_provider_base() -> type:
     for module_name in (
@@ -136,7 +143,7 @@ class StreamloaderMAProvider(MusicProviderBase):
         self.domain = self._provider_domain
 
         base_url = self._config_value("base_url", "http://streamloader:41422").rstrip("/")
-        api_key = self._config_value("api_key", "") or None
+        api_key = self._read_api_key()
         try:
             request_timeout = max(2.0, float(self._config_value("request_timeout_seconds", "25")))
         except Exception:
@@ -225,6 +232,30 @@ class StreamloaderMAProvider(MusicProviderBase):
         if value is None:
             value = getattr(config, key, default)
         return str(value if value is not None else default)
+
+    def _read_api_key(self) -> str | None:
+        """Return the decrypted api_key, or None if not configured.
+
+        MA's ``Config.get_value`` decrypts SECURE_STRING entries via the
+        DECRYPT_CALLBACK installed by the config controller, so the standard
+        path returns the plaintext key. However, if a prior save corrupted
+        storage by round-tripping the SECURE_STRING placeholder through
+        ``Config.update()``, the decrypted result will be the literal
+        sentinel ``"this_value_is_encrypted"``. Treat that as no key so we
+        don't ship it as a query-string credential (the backend rightly
+        rejects it with 401).
+        """
+        value = self._config_value("api_key", "")
+        if not value:
+            return None
+        if value == _SECURE_STRING_PLACEHOLDER:
+            _LOGGER.warning(
+                "Streamloader api_key in config is the SECURE_STRING placeholder "
+                "(prior save was corrupted); treating as unset. "
+                "Re-enter the API key in provider settings to restore auth."
+            )
+            return None
+        return value
 
     def _config_bool(self, key: str, default: bool = False) -> bool:
         value = self._config_value(key, "true" if default else "false").strip().lower()

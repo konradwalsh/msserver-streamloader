@@ -98,23 +98,58 @@ async def get_config_entries(
 
     base_url_value = str(_value_for("base_url") or "http://streamloader:8000")
 
-    existing_api_key = existing_values.get("api_key")
-    existing_api_key_text = str(existing_api_key) if existing_api_key else ""
+    # Resolve the api_key value to use for the "Test connection" action.
+    # IMPORTANT: do NOT set the SECURE_STRING entry's `value=` field. MA's
+    # `Config.parse()` already populates the value from the encrypted blob
+    # in storage; baking a value (especially the SECURE_STRING_SUBSTITUTE
+    # placeholder) into the entry risks round-tripping the placeholder into
+    # storage on save -- which would then surface as the literal string
+    # "this_value_is_encrypted" downstream. Leave it to MA.
+    #
+    # For the test_connection action we need the *decrypted* key. The raw
+    # values dict supplied to this entrypoint by MA's get_provider_config
+    # contains either the user-typed plaintext (during add/edit), the
+    # SECURE_STRING_SUBSTITUTE placeholder (during action invocation when
+    # the field is unchanged), or the encrypted blob (during the internal
+    # round-trip from get_provider_config -> get_provider_config_entries).
     incoming_api_key = _extract_raw(values.get("api_key"))
+    api_key_for_test = ""
     if incoming_api_key in (None, "", SECURE_STRING_SUBSTITUTE):
-        # MA expects a plain placeholder token in config forms for secure fields.
-        api_key_value = SECURE_STRING_SUBSTITUTE if existing_api_key_text else ""
-        api_key_for_test = existing_api_key_text
+        # Fall back to the stored, decrypted key.
+        if instance_id and hasattr(mass, "config"):
+            raw_stored = mass.config.get_raw_provider_config_value(
+                instance_id, "api_key"
+            )
+            if raw_stored:
+                try:
+                    decrypted = mass.config.decrypt_string(str(raw_stored))
+                except Exception:
+                    decrypted = ""
+                if decrypted and decrypted != SECURE_STRING_SUBSTITUTE:
+                    api_key_for_test = decrypted
+    elif isinstance(incoming_api_key, str) and incoming_api_key.startswith("_encrypted_"):
+        # Raw encrypted blob passed in via internal round-trip; decrypt it.
+        try:
+            decrypted = mass.config.decrypt_string(incoming_api_key)
+        except Exception:
+            decrypted = ""
+        if decrypted and decrypted != SECURE_STRING_SUBSTITUTE:
+            api_key_for_test = decrypted
     else:
-        api_key_value = str(incoming_api_key)
-        api_key_for_test = api_key_value
+        api_key_for_test = str(incoming_api_key)
 
     success_label: str | None = None
     clear_label: str | None = None
     if action == "clear_api_key":
-        api_key_value = ""
         api_key_for_test = ""
-        clear_label = "API key cleared. Press Save to persist."
+        if instance_id and hasattr(mass, "config"):
+            try:
+                await mass.config.remove_provider_config_value(instance_id, "api_key")
+                clear_label = "API key cleared."
+            except Exception as exc:
+                clear_label = f"Failed to clear API key: {exc}"
+        else:
+            clear_label = "API key cleared. Press Save to persist."
 
     if action == "test_connection":
         from .provider import StreamloaderClient, StreamloaderConfig
@@ -181,7 +216,14 @@ async def get_config_entries(
                 type=ConfigEntryType.SECURE_STRING,
                 label="API key (optional)",
                 required=False,
-                value=api_key_value,
+                # NOTE: deliberately no `value=` -- MA's Config.parse() will
+                # populate the value from the encrypted blob in storage.
+                # Setting `value=` here on a SECURE_STRING field causes MA's
+                # update() flow to overwrite the stored encrypted blob with
+                # whatever we pass (incl. the SECURE_STRING_SUBSTITUTE
+                # placeholder), which then surfaces as the literal string
+                # "this_value_is_encrypted" downstream. See production logs
+                # 2026-04-29 17:37 for the failure mode.
                 category="generic",
                 description="Only required if streamloader enforces API auth.",
             ),
