@@ -51,10 +51,10 @@ class StreamloaderClient:
 
     @property
     def _headers(self) -> dict[str, str]:
-        headers: dict[str, str] = {"Accept": "application/json"}
-        if self._api_key:
-            headers["Authorization"] = f"Bearer {self._api_key}"
-        return headers
+        # Auth is now carried via ?api_key= query string (see _request_json
+        # and _with_api_key) so it survives reverse proxies that strip the
+        # Authorization header. This property only contributes Accept now.
+        return {"Accept": "application/json"}
 
     @staticmethod
     def _derive_fallback_base_url(base_url: str) -> str | None:
@@ -102,11 +102,21 @@ class StreamloaderClient:
         json_body: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         async def _do_request(base_url: str) -> dict[str, Any]:
-            async with httpx.AsyncClient(timeout=self._timeout_seconds, headers=self._headers) as client:
+            # Carry auth via ?api_key= query string so requests survive
+            # reverse proxies that strip Authorization headers (e.g. NPMplus).
+            # Backend's _extract_supplied_key accepts api_key= as a fallback
+            # after Authorization: Bearer and X-API-Key.
+            final_params: dict[str, Any] = dict(params or {})
+            if self._api_key:
+                final_params.setdefault("api_key", self._api_key)
+            async with httpx.AsyncClient(
+                timeout=self._timeout_seconds,
+                headers={"Accept": "application/json"},
+            ) as client:
                 response = await client.request(
                     method.upper(),
                     f"{base_url}{path}",
-                    params=params,
+                    params=final_params,
                     json=json_body,
                 )
                 response.raise_for_status()
