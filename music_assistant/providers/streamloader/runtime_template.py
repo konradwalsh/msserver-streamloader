@@ -7,12 +7,15 @@ developed/tested outside MA and dropped into a running MA instance.
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from collections.abc import AsyncGenerator
 from typing import Any
 from urllib.parse import quote, unquote, unquote_plus
 
 from .provider import StreamloaderMAAdapter, StreamloaderMusicProvider
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def _import_music_provider_base() -> type:
@@ -1622,6 +1625,17 @@ class StreamloaderMAProvider(MusicProviderBase):
         for album in albums:
             if not isinstance(album, dict):
                 continue
+            # Bug 1 fix: skip albums with empty name rather than emit a
+            # phantom "Unknown Album" row in MA's artist page.
+            album_name = (
+                str(album.get("name") or album.get("album_name") or "").strip()
+            )
+            if not album_name:
+                _LOGGER.debug(
+                    "get_artist_albums(%s): skipping unnamed album row id=%r",
+                    prov_artist_id, album.get("id") or album.get("album_id"),
+                )
+                continue
             mapped.append(
                 self._adapter._to_ma_object(
                     "album",
@@ -1629,7 +1643,7 @@ class StreamloaderMAProvider(MusicProviderBase):
                         "item_id": str(
                             self._adapter._encode_provider_id(album.get("id") or album.get("album_id") or "")
                         ),
-                        "name": album.get("name") or album.get("album_name") or "Unknown Album",
+                        "name": album_name,
                         "media_type": "album",
                         "artist": album.get("artist_name"),
                         "artist_id": self._adapter._encode_provider_id(
@@ -1873,6 +1887,7 @@ class StreamloaderMAProvider(MusicProviderBase):
                 name = unquote_plus(decoded_album_id.replace("local-album-", "", 1))
             elif decoded_album_id.startswith("album/"):
                 name = unquote_plus(decoded_album_id.replace("album/", "", 1))
+            album_path = str(name)
             artist_name = ""
             segments = [segment for segment in str(name).split("/") if segment]
             if len(segments) >= 2:
@@ -1899,8 +1914,33 @@ class StreamloaderMAProvider(MusicProviderBase):
                                 "image_url": image_url,
                             },
                         )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # Bug 1 fix: surface the failure so we can tell metadata-gap
+                    # from backend-flake. Was a silent ``except Exception: pass``.
+                    _LOGGER.warning(
+                        "get_album(%s): /api/album/local failed for artist=%r album=%r: %s",
+                        prov_album_id, artist_name, name, exc,
+                    )
+            # Bug 1 fix: before returning a stub with "Unknown Album", try one
+            # last folder-name lookup via browse_library. Capped to a single
+            # call (no retry) so the album-page hot path stays fast.
+            if not str(name or "").strip():
+                try:
+                    entries = await self._provider.browse_library(album_path)
+                except Exception as exc:
+                    _LOGGER.warning(
+                        "get_album(%s): browse_library fallback failed for path=%r: %s",
+                        prov_album_id, album_path, exc,
+                    )
+                    entries = []
+                for entry in entries or []:
+                    if not isinstance(entry, dict):
+                        continue
+                    entry_name = str(entry.get("name") or "").strip()
+                    entry_type = str(entry.get("entry_type") or "").lower()
+                    if entry_name and entry_type in ("album", "folder"):
+                        name = entry_name
+                        break
             return self._adapter._to_ma_object(
                 "album",
                 {
@@ -1928,9 +1968,26 @@ class StreamloaderMAProvider(MusicProviderBase):
         # streamloader /api/album returns AlbumResponse: {"album": MediaItem, "tracks": [...]}.
         # Unwrap the envelope; tolerate a flat dict in case the contract changes.
         album_data = payload.get("album") if isinstance(payload.get("album"), dict) else payload
+        # Bug 1 fix: if the backend response lacks a name, raise so MA's caller
+        # surfaces this as "album not found" instead of rendering a phantom
+        # "Unknown Album" placeholder. _raise_unavailable only re-raises for
+        # transport-error needles, so a plain ValueError is used here.
+        album_name = (
+            str(album_data.get("name") or "").strip()
+            if isinstance(album_data, dict)
+            else ""
+        )
+        if not album_name:
+            _LOGGER.warning(
+                "get_album(%s): backend returned album without name (data=%r)",
+                prov_album_id, album_data,
+            )
+            raise ValueError(
+                f"backend returned album {prov_album_id} without name"
+            )
         item = {
             "item_id": str(self._adapter._encode_provider_id(album_data.get("id", decoded_album_id))),
-            "name": album_data.get("name") or "Unknown Album",
+            "name": album_name,
             "media_type": "album",
             "artist": album_data.get("artist_name"),
             "year": album_data.get("year"),

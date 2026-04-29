@@ -7,11 +7,14 @@ in use when integrating.
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote, unquote, urlencode, urlsplit, urlunsplit
 
 import httpx
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -651,11 +654,23 @@ class StreamloaderMAAdapter:
         }
 
     @staticmethod
-    def _map_album_item(item: dict[str, Any]) -> dict[str, Any]:
+    def _map_album_item(item: dict[str, Any]) -> dict[str, Any] | None:
+        # Skip phantom rows (no name) rather than render "Unknown Album" in MA.
+        # Bug 1 fix: federated rows with empty/missing name produced visible
+        # "Unknown Album" placeholders in search/browse results.
+        name = (item.get("name") or item.get("album_name") or "")
+        if isinstance(name, str):
+            name = name.strip()
+        if not name:
+            _LOGGER.debug(
+                "_map_album_item: skipping unnamed album row id=%r",
+                item.get("id"),
+            )
+            return None
         raw_album_id = item.get("id", "")
         return {
             "item_id": StreamloaderMAAdapter._encode_provider_id(raw_album_id),
-            "name": item.get("name") or "Unknown Album",
+            "name": name,
             "media_type": "album",
             "artist": item.get("artist_name"),
             "year": item.get("year"),
@@ -675,7 +690,13 @@ class StreamloaderMAAdapter:
     async def mapped_search(self, query: str) -> MappedSearchResult:
         payload = await self.provider.search_items(query)
         tracks = [self._map_track_item(item) for item in payload.get("tracks", [])]
-        albums = [self._map_album_item(item) for item in payload.get("albums", [])]
+        # _map_album_item returns None for unnamed rows; filter them out so MA
+        # does not render phantom "Unknown Album" entries in search results.
+        albums = [
+            mapped
+            for mapped in (self._map_album_item(item) for item in payload.get("albums", []))
+            if mapped is not None
+        ]
         artists = [self._map_artist_item(item) for item in payload.get("artists", [])]
         return MappedSearchResult(tracks=tracks, albums=albums, artists=artists)
 
