@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
+from collections import OrderedDict
 from collections.abc import AsyncGenerator
 from typing import Any
 from urllib.parse import quote, unquote, unquote_plus
@@ -16,6 +18,12 @@ from urllib.parse import quote, unquote, unquote_plus
 from .provider import StreamloaderMAAdapter, StreamloaderMusicProvider
 
 _LOGGER = logging.getLogger(__name__)
+
+# Bug 2 stage A: bound the artist-name cache so a long-running plugin can't
+# accumulate stale or polluted entries indefinitely. LRU eviction keeps the
+# most-recently-used names; TTL forces a fresh fetch after a quiet window.
+_LRU_MAX = 256
+_CACHE_TTL_SECONDS = 300
 
 
 def _import_music_provider_base() -> type:
@@ -161,7 +169,11 @@ class StreamloaderMAProvider(MusicProviderBase):
         self._strict_startup_health_check = self._config_bool("strict_startup_health_check", True)
         self._seen_auto_download_tracks: set[str] = set()
         self._seen_auto_download_albums: set[str] = set()
-        self._artist_name_cache: dict[str, str] = {}
+        # Bug 2 stage A: artist-name cache is an LRU+TTL OrderedDict. Each
+        # value is (name, timestamp). Read via _recall_artist_name (returns
+        # None when soft-expired so callers fetch fresh), write via
+        # _remember_artist_name (which evicts oldest beyond _LRU_MAX).
+        self._artist_name_cache: OrderedDict[str, tuple[str, float]] = OrderedDict()
         # Lowercase names of library artists, refreshed during get_library_artists.
         # Used by search() to filter out live-provider duplicates of artists
         # already present in the local library.
@@ -549,6 +561,12 @@ class StreamloaderMAProvider(MusicProviderBase):
         return bool(target_name and candidate_name and target_name == candidate_name)
 
     def _is_artist_name_conflict(self, preferred_name: str, candidate_name: str) -> bool:
+        # TODO(bug2-stage-b): the conflict guard currently makes the cached name
+        # win over the backend response. Stage B (per audit) will invert this
+        # bias for non-local IDs, but only after stage-A telemetry confirms the
+        # cache is actually polluted in the wild. There are likely federated
+        # cases where the cached name IS the better one; do not flip the bias
+        # blindly.
         left = self._norm_text(preferred_name)
         right = self._norm_text(candidate_name)
         if not left or not right:
@@ -556,6 +574,40 @@ class StreamloaderMAProvider(MusicProviderBase):
         if left == right:
             return False
         return True
+
+    def _remember_artist_name(self, artist_id: Any, name: Any) -> None:
+        """LRU+TTL write helper for the artist-name cache.
+
+        Empty ids/names are silently ignored. Eviction beyond _LRU_MAX drops
+        the oldest entries.
+        """
+        key = str(artist_id or "").strip()
+        value = str(name or "").strip()
+        if not key or not value:
+            return
+        self._artist_name_cache[key] = (value, time.time())
+        self._artist_name_cache.move_to_end(key)
+        while len(self._artist_name_cache) > _LRU_MAX:
+            self._artist_name_cache.popitem(last=False)
+
+    def _recall_artist_name(self, artist_id: Any) -> str | None:
+        """LRU+TTL read helper for the artist-name cache.
+
+        Returns the cached name only when fresh. Soft-expired entries
+        (older than _CACHE_TTL_SECONDS) return None so the caller refetches;
+        this prevents stale names from winning the conflict guard.
+        """
+        key = str(artist_id or "").strip()
+        if not key:
+            return None
+        entry = self._artist_name_cache.get(key)
+        if not entry:
+            return None
+        name, ts = entry
+        if time.time() - ts > _CACHE_TTL_SECONDS:
+            return None
+        self._artist_name_cache.move_to_end(key)
+        return name
 
     @property
     def supported_features(self) -> set[Any]:
@@ -639,6 +691,16 @@ class StreamloaderMAProvider(MusicProviderBase):
             for e in artist_entries
             if str(e.get("name") or "").strip()
         }
+        # Bug 2 stage A: a library scan is the strongest "on-disk truth has
+        # changed" signal we get. Drop the artist-name cache so any stale or
+        # polluted entries don't continue to win the conflict guard. Names
+        # repopulate naturally on next read.
+        if self._artist_name_cache:
+            _LOGGER.debug(
+                "get_library_artists: clearing artist-name cache (%d entries)",
+                len(self._artist_name_cache),
+            )
+            self._artist_name_cache.clear()
         for entry in artist_entries:
             if not isinstance(entry, dict) or str(entry.get("entry_type", "")).lower() != "artist":
                 continue
@@ -1014,6 +1076,24 @@ class StreamloaderMAProvider(MusicProviderBase):
         return mapped
 
     async def search(self, search_query: str, media_types: Any = None, limit: int = 25) -> Any:
+        # Bug 2 stage A (A4): always refresh _library_artist_names_lower at
+        # the top of search() rather than only-when-empty. The previous logic
+        # held a stale snapshot until plugin restart, so artists removed from
+        # disk continued to be filtered out of upstream search results
+        # (and ones added didn't dedupe). One filesystem scan per search
+        # is cheap on the backend.
+        try:
+            top_level = await self._provider.browse_library("")
+            self._library_artist_names_lower = {
+                str(e.get("name") or "").strip().lower()
+                for e in top_level
+                if isinstance(e, dict)
+                and str(e.get("entry_type", "")).lower() == "artist"
+                and str(e.get("name") or "").strip()
+            }
+        except Exception as exc:
+            _LOGGER.debug("search: could not refresh library artists set: %s", exc)
+            # Keep the existing set rather than failing the search.
         try:
             mapped = await self._adapter.mapped_search_for_ma(search_query)
         except Exception as exc:
@@ -1028,22 +1108,8 @@ class StreamloaderMAProvider(MusicProviderBase):
         except Exception:
             # Dedup must never break search; fall through with the raw mapping.
             pass
-        # Eagerly populate the library names if MA has not yet called
-        # get_library_artists since startup -- otherwise the first search after
-        # a restart has an empty set and the filter below is a no-op.
-        if not self._library_artist_names_lower:
-            try:
-                top_level = await self._provider.browse_library("")
-                self._library_artist_names_lower = {
-                    str(e.get("name") or "").strip().lower()
-                    for e in top_level
-                    if isinstance(e, dict)
-                    and str(e.get("entry_type", "")).lower() == "artist"
-                    and str(e.get("name") or "").strip()
-                }
-            except Exception:
-                # Filesystem unavailable -- skip filtering rather than fail search.
-                pass
+        # _library_artist_names_lower already refreshed at top of search()
+        # via Bug 2 stage A (A4); no need to re-populate here.
         # Drop live-provider artist hits whose name already exists in the library.
         # MA otherwise shows two cards for the same artist -- one local, one upstream --
         # because the two sources carry different provider URIs. We prefer the local one.
@@ -1115,9 +1181,9 @@ class StreamloaderMAProvider(MusicProviderBase):
             if not artist_id or not artist_name:
                 continue
             decoded_id = self._adapter.decode_provider_id(artist_id)
-            self._artist_name_cache[artist_id] = artist_name
+            self._remember_artist_name(artist_id, artist_name)
             if decoded_id:
-                self._artist_name_cache[decoded_id] = artist_name
+                self._remember_artist_name(decoded_id, artist_name)
         for track in list(mapped.get("tracks", [])):
             track_artist_id = ""
             track_artist_name = ""
@@ -1138,9 +1204,9 @@ class StreamloaderMAProvider(MusicProviderBase):
                     track_artist_name = str(getattr(track, "artist_name", "") or "").strip()
             if track_artist_id and track_artist_name and not self._looks_like_uri_name(track_artist_name):
                 decoded_id = self._adapter.decode_provider_id(track_artist_id)
-                self._artist_name_cache[track_artist_id] = track_artist_name
+                self._remember_artist_name(track_artist_id, track_artist_name)
                 if decoded_id:
-                    self._artist_name_cache[decoded_id] = track_artist_name
+                    self._remember_artist_name(decoded_id, track_artist_name)
         for album in list(mapped.get("albums", [])):
             album_artist_id = ""
             album_artist_name = ""
@@ -1161,9 +1227,9 @@ class StreamloaderMAProvider(MusicProviderBase):
                     album_artist_name = str(getattr(album, "artist_name", "") or "").strip()
             if album_artist_id and album_artist_name and not self._looks_like_uri_name(album_artist_name):
                 decoded_id = self._adapter.decode_provider_id(album_artist_id)
-                self._artist_name_cache[album_artist_id] = album_artist_name
+                self._remember_artist_name(album_artist_id, album_artist_name)
                 if decoded_id:
-                    self._artist_name_cache[decoded_id] = album_artist_name
+                    self._remember_artist_name(decoded_id, album_artist_name)
         if SearchResultsModel is None:
             return mapped
         try:
@@ -1228,22 +1294,22 @@ class StreamloaderMAProvider(MusicProviderBase):
         decoded_artist_id = self._adapter.decode_provider_id(prov_artist_id)
         explicit_artist_uri = "://artist/" in decoded_artist_id
         cached_name = (
-            self._artist_name_cache.get(str(prov_artist_id).strip())
-            or self._artist_name_cache.get(decoded_artist_id)
+            self._recall_artist_name(str(prov_artist_id).strip())
+            or self._recall_artist_name(decoded_artist_id)
             or ""
         )
         if not cached_name and explicit_artist_uri:
             resolved = await self._resolve_artist_name_from_catalog(decoded_artist_id)
             if resolved:
                 cached_name = resolved
-                self._artist_name_cache[str(prov_artist_id).strip()] = resolved
-                self._artist_name_cache[decoded_artist_id] = resolved
+                self._remember_artist_name(str(prov_artist_id).strip(), resolved)
+                self._remember_artist_name(decoded_artist_id, resolved)
         if not cached_name and explicit_artist_uri:
             resolved = await self._resolve_artist_name_from_locked_tracks(decoded_artist_id)
             if resolved:
                 cached_name = resolved
-                self._artist_name_cache[str(prov_artist_id).strip()] = resolved
-                self._artist_name_cache[decoded_artist_id] = resolved
+                self._remember_artist_name(str(prov_artist_id).strip(), resolved)
+                self._remember_artist_name(decoded_artist_id, resolved)
         if decoded_artist_id.startswith("local-artist-") or decoded_artist_id.startswith("artist/"):
             name = decoded_artist_id
             if decoded_artist_id.startswith("local-artist-"):
@@ -1251,8 +1317,8 @@ class StreamloaderMAProvider(MusicProviderBase):
             elif decoded_artist_id.startswith("artist/"):
                 name = unquote_plus(decoded_artist_id.replace("artist/", "", 1))
             if name:
-                self._artist_name_cache[str(prov_artist_id).strip()] = name
-                self._artist_name_cache[decoded_artist_id] = name
+                self._remember_artist_name(str(prov_artist_id).strip(), name)
+                self._remember_artist_name(decoded_artist_id, name)
             return self._adapter._to_ma_object(
                 "artist",
                 {
@@ -1304,10 +1370,10 @@ class StreamloaderMAProvider(MusicProviderBase):
                         "Unknown Artist",
                     )
                 if resolved_name:
-                    self._artist_name_cache[str(prov_artist_id).strip()] = resolved_name
-                    self._artist_name_cache[decoded_artist_id] = resolved_name
+                    self._remember_artist_name(str(prov_artist_id).strip(), resolved_name)
+                    self._remember_artist_name(decoded_artist_id, resolved_name)
                     if returned_id:
-                        self._artist_name_cache[returned_id] = resolved_name
+                        self._remember_artist_name(returned_id, resolved_name)
                 return self._adapter._to_ma_object(
                     "artist",
                     {
@@ -1319,6 +1385,19 @@ class StreamloaderMAProvider(MusicProviderBase):
                         "image_url": payload.get("artist_image_url") or payload.get("image_url"),
                     },
                 )
+        except ValueError as exc:
+            # Bug 2 stage A (A5): the mismatched-artist-id ValueError used to
+            # fall silently through to the fallback search below, which would
+            # then install whatever the search returned into the artist-name
+            # cache -- the exact pollution mechanism behind the stale-artist
+            # bug. Log loudly and re-raise so the caller (and our logs) see
+            # the backend mismatch instead of silently substituting bad data.
+            _LOGGER.warning(
+                "get_artist(%s): backend returned mismatched id, refusing to "
+                "fall through to fallback search: %s",
+                prov_artist_id, exc,
+            )
+            raise
         except Exception as exc:
             self._raise_unavailable(exc, "artist lookup")
         fallback_query = decoded_artist_id
@@ -1344,22 +1423,22 @@ class StreamloaderMAProvider(MusicProviderBase):
             ).strip()
             if artist_id == str(prov_artist_id):
                 if artist_name:
-                    self._artist_name_cache[str(prov_artist_id).strip()] = artist_name
-                    self._artist_name_cache[decoded_artist_id] = artist_name
+                    self._remember_artist_name(str(prov_artist_id).strip(), artist_name)
+                    self._remember_artist_name(decoded_artist_id, artist_name)
                 return artist
             decoded_match_id = self._adapter.decode_provider_id(artist_id)
             if explicit_artist_uri and decoded_match_id and decoded_match_id == decoded_artist_id:
                 if artist_name:
-                    self._artist_name_cache[str(prov_artist_id).strip()] = artist_name
-                    self._artist_name_cache[decoded_artist_id] = artist_name
+                    self._remember_artist_name(str(prov_artist_id).strip(), artist_name)
+                    self._remember_artist_name(decoded_artist_id, artist_name)
                 return artist
         if explicit_artist_uri:
             if not cached_name or self._looks_like_uri_name(cached_name):
                 inferred_from_albums = await self._resolve_artist_name_from_albums(decoded_artist_id)
                 if inferred_from_albums:
                     cached_name = inferred_from_albums
-                    self._artist_name_cache[str(prov_artist_id).strip()] = inferred_from_albums
-                    self._artist_name_cache[decoded_artist_id] = inferred_from_albums
+                    self._remember_artist_name(str(prov_artist_id).strip(), inferred_from_albums)
+                    self._remember_artist_name(decoded_artist_id, inferred_from_albums)
             fallback_name = str(cached_name or "").strip()
             if not fallback_name or self._looks_like_uri_name(fallback_name):
                 tail_name = self._id_tail(decoded_artist_id)
@@ -1430,8 +1509,8 @@ class StreamloaderMAProvider(MusicProviderBase):
                 )
             return mapped
         cached_name = (
-            self._artist_name_cache.get(str(prov_artist_id).strip())
-            or self._artist_name_cache.get(decoded_artist_id)
+            self._recall_artist_name(str(prov_artist_id).strip())
+            or self._recall_artist_name(decoded_artist_id)
             or ""
         )
         if not cached_name and "://artist/" in decoded_artist_id:
@@ -1443,20 +1522,20 @@ class StreamloaderMAProvider(MusicProviderBase):
                 resolved_name = str(artist_payload.get("name") or "").strip()
                 if resolved_name:
                     cached_name = resolved_name
-                    self._artist_name_cache[str(prov_artist_id).strip()] = resolved_name
-                    self._artist_name_cache[decoded_artist_id] = resolved_name
+                    self._remember_artist_name(str(prov_artist_id).strip(), resolved_name)
+                    self._remember_artist_name(decoded_artist_id, resolved_name)
         if not cached_name and "://artist/" in decoded_artist_id:
             resolved = await self._resolve_artist_name_from_catalog(decoded_artist_id)
             if resolved:
                 cached_name = resolved
-                self._artist_name_cache[str(prov_artist_id).strip()] = resolved
-                self._artist_name_cache[decoded_artist_id] = resolved
+                self._remember_artist_name(str(prov_artist_id).strip(), resolved)
+                self._remember_artist_name(decoded_artist_id, resolved)
         if not cached_name and "://artist/" in decoded_artist_id:
             resolved = await self._resolve_artist_name_from_albums(decoded_artist_id)
             if resolved:
                 cached_name = resolved
-                self._artist_name_cache[str(prov_artist_id).strip()] = resolved
-                self._artist_name_cache[decoded_artist_id] = resolved
+                self._remember_artist_name(str(prov_artist_id).strip(), resolved)
+                self._remember_artist_name(decoded_artist_id, resolved)
         if (not cached_name or self._looks_like_uri_name(cached_name)) and "://artist/" in decoded_artist_id:
             resolved = await self._resolve_artist_name_from_locked_tracks(
                 decoded_artist_id,
@@ -1464,8 +1543,8 @@ class StreamloaderMAProvider(MusicProviderBase):
             )
             if resolved and not self._looks_like_uri_name(resolved):
                 cached_name = resolved
-                self._artist_name_cache[str(prov_artist_id).strip()] = resolved
-                self._artist_name_cache[decoded_artist_id] = resolved
+                self._remember_artist_name(str(prov_artist_id).strip(), resolved)
+                self._remember_artist_name(decoded_artist_id, resolved)
         if self._looks_like_uri_name(cached_name):
             cached_name = ""
         try:
@@ -1570,8 +1649,8 @@ class StreamloaderMAProvider(MusicProviderBase):
                                 candidate_name = name
                                 break
                 if candidate_name:
-                    self._artist_name_cache[str(prov_artist_id).strip()] = candidate_name
-                    self._artist_name_cache[decoded_artist_id] = candidate_name
+                    self._remember_artist_name(str(prov_artist_id).strip(), candidate_name)
+                    self._remember_artist_name(decoded_artist_id, candidate_name)
                     try:
                         fallback = await self._provider.search_items(
                             candidate_name,
@@ -1618,7 +1697,7 @@ class StreamloaderMAProvider(MusicProviderBase):
                     candidate_albums = []
                 if len(candidate_albums) > len(best_albums):
                     best_albums = candidate_albums
-                    self._artist_name_cache[candidate_id] = cached_name
+                    self._remember_artist_name(candidate_id, cached_name)
             if best_albums:
                 albums = best_albums
         mapped: list[Any] = []
@@ -1657,17 +1736,17 @@ class StreamloaderMAProvider(MusicProviderBase):
             album_artist_name = str(album.get("artist_name") or "").strip()
             album_artist_id = self._adapter.decode_provider_id(album.get("artist_id") or "")
             if album_artist_name and not self._looks_like_uri_name(album_artist_name):
-                self._artist_name_cache[str(prov_artist_id).strip()] = album_artist_name
-                self._artist_name_cache[decoded_artist_id] = album_artist_name
+                self._remember_artist_name(str(prov_artist_id).strip(), album_artist_name)
+                self._remember_artist_name(decoded_artist_id, album_artist_name)
                 if album_artist_id:
-                    self._artist_name_cache[album_artist_id] = album_artist_name
+                    self._remember_artist_name(album_artist_id, album_artist_name)
         return mapped
 
     async def get_artist_toptracks(self, prov_artist_id: str) -> list[Any]:
         decoded_artist_id = self._adapter.decode_provider_id(prov_artist_id)
         cached_name = (
-            self._artist_name_cache.get(str(prov_artist_id).strip())
-            or self._artist_name_cache.get(decoded_artist_id)
+            self._recall_artist_name(str(prov_artist_id).strip())
+            or self._recall_artist_name(decoded_artist_id)
             or ""
         ).strip()
         if not cached_name and "://artist/" in decoded_artist_id:
@@ -1679,8 +1758,8 @@ class StreamloaderMAProvider(MusicProviderBase):
             if isinstance(artist_payload, dict):
                 cached_name = str(artist_payload.get("name") or "").strip()
                 if cached_name:
-                    self._artist_name_cache[str(prov_artist_id).strip()] = cached_name
-                    self._artist_name_cache[decoded_artist_id] = cached_name
+                    self._remember_artist_name(str(prov_artist_id).strip(), cached_name)
+                    self._remember_artist_name(decoded_artist_id, cached_name)
 
         query = cached_name or self._id_tail(decoded_artist_id) or str(prov_artist_id)
         try:
