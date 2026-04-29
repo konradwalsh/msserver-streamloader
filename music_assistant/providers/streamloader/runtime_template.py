@@ -898,12 +898,133 @@ class StreamloaderMAProvider(MusicProviderBase):
     async def library_remove(self, prov_item_id: str, media_type: Any) -> bool:
         return False
 
+    def _dedupe_search_results(self, mapped: Any) -> Any:
+        """Dedup search-result tracks and albums by content identity.
+
+        The same logical recording can surface under multiple upstream IDs
+        (federated catalog + local library copy + mix-context-flavoured ID).
+        MA renders one row per ID, so without dedup the user sees the same
+        track 2-3 times. Prefer ``library:...`` IDs over ``monochrome://``
+        over anything else (per streamloader_source_of_truth memory: local
+        always wins). Artists are deliberately untouched -- the existing
+        library-artist filter at the top of ``search()`` already handles them.
+        """
+
+        def _name(item: Any) -> str:
+            value = item.get("name") if isinstance(item, dict) else getattr(item, "name", "")
+            return str(value or "")
+
+        def _first_artist_name(item: Any) -> str:
+            artists = item.get("artists") if isinstance(item, dict) else getattr(item, "artists", None)
+            if artists:
+                first = artists[0]
+                value = (
+                    first.get("name") if isinstance(first, dict) else getattr(first, "name", "")
+                )
+                if value:
+                    return str(value)
+            # Fall back to the flat artist field used by some adapter shapes.
+            value = (
+                item.get("artist") or item.get("artist_name")
+                if isinstance(item, dict)
+                else getattr(item, "artist", "") or getattr(item, "artist_name", "")
+            )
+            return str(value or "")
+
+        def track_key(track: Any) -> tuple[str, str, int]:
+            duration = (
+                track.get("duration") if isinstance(track, dict) else getattr(track, "duration", 0)
+            )
+            try:
+                duration_bucket = int(duration or 0) // 2
+            except (TypeError, ValueError):
+                duration_bucket = 0
+            return (
+                _first_artist_name(track).strip().lower(),
+                _name(track).strip().lower(),
+                duration_bucket,
+            )
+
+        def album_key(album: Any) -> tuple[str, str, int]:
+            year = album.get("year") if isinstance(album, dict) else getattr(album, "year", None)
+            try:
+                year_int = int(year or 0)
+            except (TypeError, ValueError):
+                year_int = 0
+            return (
+                _first_artist_name(album).strip().lower(),
+                _name(album).strip().lower(),
+                year_int,
+            )
+
+        def id_priority(item: Any) -> int:
+            item_id = (
+                item.get("item_id") if isinstance(item, dict) else getattr(item, "item_id", "")
+            )
+            try:
+                decoded = self._adapter.decode_provider_id(str(item_id or ""))
+            except Exception:
+                decoded = str(item_id or "")
+            if decoded.startswith("library:"):
+                return 0
+            if "monochrome://" in decoded:
+                return 1
+            return 2
+
+        def dedup(items: list[Any], keyfn: Any) -> list[Any]:
+            seen: dict[Any, Any] = {}
+            for item in items:
+                try:
+                    key = keyfn(item)
+                except Exception:
+                    # Anything we can't key safely passes through under a
+                    # unique sentinel so we don't accidentally collapse it.
+                    seen[(id(item),)] = item
+                    continue
+                # Skip empty-key items (no artist + no name) -- treat them as unique.
+                if not any(key):
+                    seen[(id(item),)] = item
+                    continue
+                existing = seen.get(key)
+                if existing is None or id_priority(item) < id_priority(existing):
+                    seen[key] = item
+            return list(seen.values())
+
+        if isinstance(mapped, dict):
+            return {
+                **mapped,
+                "tracks": dedup(list(mapped.get("tracks", [])), track_key),
+                "albums": dedup(list(mapped.get("albums", [])), album_key),
+            }
+        # Dataclass / model with .tracks / .albums attributes.
+        if hasattr(mapped, "tracks") and hasattr(mapped, "albums"):
+            try:
+                deduped_tracks = dedup(list(getattr(mapped, "tracks", []) or []), track_key)
+                deduped_albums = dedup(list(getattr(mapped, "albums", []) or []), album_key)
+                return type(mapped)(
+                    tracks=deduped_tracks,
+                    albums=deduped_albums,
+                    artists=getattr(mapped, "artists", []),
+                )
+            except Exception:
+                return mapped
+        return mapped
+
     async def search(self, search_query: str, media_types: Any = None, limit: int = 25) -> Any:
         try:
             mapped = await self._adapter.mapped_search_for_ma(search_query)
         except Exception as exc:
             self._raise_unavailable(exc, "search")
             mapped = {"tracks": [], "albums": [], "artists": []}
+        # Dedup tracks + albums BEFORE artist filtering / limit slicing so the
+        # limit returns N unique items, not N raw items containing duplicates.
+        # Federated + library + mix-context IDs can all surface the same logical
+        # recording; MA renders one row per ID, so duplicates were visible to users.
+        try:
+            mapped = self._dedupe_search_results(mapped)
+        except Exception:
+            # Dedup must never break search; fall through with the raw mapping.
+            pass
         # Eagerly populate the library names if MA has not yet called
         # get_library_artists since startup -- otherwise the first search after
         # a restart has an empty set and the filter below is a no-op.
