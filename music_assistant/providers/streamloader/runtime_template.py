@@ -1079,8 +1079,12 @@ class StreamloaderMAProvider(MusicProviderBase):
                         type=ImageType.THUMB,
                         path=art_url,
                         provider=self.instance_id,
-                        # Let MA proxy image fetches (works better across container/local host boundaries).
-                        remotely_accessible=False,
+                        # MA 2.9 imageproxy regression — see provider.py
+                        # _to_ma_object for the full explanation. Setting
+                        # this True keeps URLs intact (skip the proxy wrap)
+                        # and matches reality: streamloader is publicly
+                        # reachable via NPMplus.
+                        remotely_accessible=True,
                     )
                 except Exception:
                     folder_image = None

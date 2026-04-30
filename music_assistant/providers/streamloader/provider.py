@@ -519,9 +519,17 @@ class StreamloaderMAAdapter:
                             type=ImageType.THUMB,
                             path=image_path,
                             provider=provider_instance,
-                            # Let MA proxy image retrieval from provider URLs
-                            # so container-only hostnames still render artwork.
-                            remotely_accessible=False,
+                            # MA 2.9 imageproxy regression: when this flag
+                            # is False, MA wraps the URL through its own
+                            # /imageproxy?path=... endpoint and the new
+                            # path-extraction logic in helpers/images.py
+                            # strips the scheme+host (only the trailing
+                            # /api/library/art/... survives). ffmpeg then
+                            # gets a relative path and fails with "No such
+                            # file or directory". Streamloader URLs ARE
+                            # publicly reachable via NPMplus, so True is
+                            # accurate AND avoids the proxy wrap entirely.
+                            remotely_accessible=True,
                         )
                     ]
                 )
