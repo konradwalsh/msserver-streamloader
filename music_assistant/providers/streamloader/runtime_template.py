@@ -2177,8 +2177,11 @@ class StreamloaderMAProvider(MusicProviderBase):
                     if parsed_duration is not None:
                         duration = parsed_duration
                     break
-            # Keep startup playback stable: disable seek probing for local streams too.
-            rel_can_seek = False
+            # Library files are served by streamloader's FileResponse, which
+            # honors HTTP Range natively (Starlette emits 206 + Content-Range).
+            # Enabling seek lets MA's player issue range requests on scrub
+            # instead of tearing down the stream and restarting from byte 0.
+            rel_can_seek = True
             payload = {
                 "url": await self._provider.get_library_stream_url(rel),
                 "can_seek": rel_can_seek,
@@ -2263,8 +2266,11 @@ class StreamloaderMAProvider(MusicProviderBase):
                 item_id=item_id,
             )
             await self._maybe_auto_queue_downloads(item_id)
-        # Provider/local streams are more stable in MA when seek probing/range-jumps are disabled.
-        can_seek = False
+        # Honor whatever can_seek the per-path branch above resolved to.
+        # Library tracks: rel_can_seek=True (Starlette FileResponse handles Range).
+        # Federated tracks: defaults to True; if upstream chunked breaks Range,
+        # MA degrades to current restart-on-scrub behaviour, no worse than before.
+        can_seek = bool(payload.get("can_seek", True))
         resolved_content_type = self._content_type_from_mime(payload.get("mime_type"))
         payload["can_seek"] = can_seek
         try:
