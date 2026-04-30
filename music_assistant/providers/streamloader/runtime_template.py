@@ -592,12 +592,11 @@ class StreamloaderMAProvider(MusicProviderBase):
         return bool(target_name and candidate_name and target_name == candidate_name)
 
     def _is_artist_name_conflict(self, preferred_name: str, candidate_name: str) -> bool:
-        # TODO(bug2-stage-b): the conflict guard currently makes the cached name
-        # win over the backend response. Stage B (per audit) will invert this
-        # bias for non-local IDs, but only after stage-A telemetry confirms the
-        # cache is actually polluted in the wild. There are likely federated
-        # cases where the cached name IS the better one; do not flip the bias
-        # blindly.
+        """Return True when two artist names disagree after normalization.
+
+        Pure name comparison; does NOT decide which side wins. Use
+        _resolve_artist_name_conflict for the bias decision (Bug 2 stage B).
+        """
         left = self._norm_text(preferred_name)
         right = self._norm_text(candidate_name)
         if not left or not right:
@@ -605,6 +604,69 @@ class StreamloaderMAProvider(MusicProviderBase):
         if left == right:
             return False
         return True
+
+    @staticmethod
+    def _is_local_artist_id(value: Any) -> bool:
+        """Return True if ``value`` is a streamloader-local artist id.
+
+        Library artists are emitted with ids of the form ``local-artist-<name>``
+        by ``_local_artist_id``. Any other id (federated monochrome://, raw
+        backend ids, etc.) is treated as non-local for the conflict bias.
+        """
+        text = str(value or "").strip()
+        return text.startswith("local-artist-")
+
+    def _resolve_artist_name_conflict(
+        self,
+        decoded_artist_id: Any,
+        prov_artist_id: Any,
+        cached_name: str,
+        backend_name: str,
+    ) -> str:
+        """Bug 2 stage B: pick the winning name when cache and backend disagree.
+
+        Bias rule:
+          - LOCAL artist ids (``local-artist-*``) prefer the cached name.
+            The library scan is authoritative on-disk truth and the cache
+            was populated from it.
+          - Non-local ids (federated/upstream) prefer the BACKEND name.
+            Stage A telemetry showed the cache could carry stale federated
+            artist names that survived a search-context shift; trusting the
+            backend response unwinds those poisoned entries.
+
+        Empty inputs short-circuit to whichever side has data. URI-shaped
+        backend names (e.g. ``monochrome://artist/...``) are still treated as
+        invalid here so we don't replace a clean cached name with a raw id.
+
+        Logs every conflict decision at INFO so MA logs serve as the
+        deferred-telemetry source the stage A audit asked for.
+        """
+        cached = (cached_name or "").strip()
+        backend = (backend_name or "").strip()
+        if not cached and not backend:
+            return ""
+        if not cached:
+            return backend
+        if not backend or self._looks_like_uri_name(backend):
+            return cached
+        if not self._is_artist_name_conflict(cached, backend):
+            return cached
+        is_local = self._is_local_artist_id(decoded_artist_id) or self._is_local_artist_id(prov_artist_id)
+        winner = "cache" if is_local else "backend"
+        chosen = cached if is_local else backend
+        try:
+            _LOGGER.info(
+                "artist-name-conflict id=%r local=%s cached=%r backend=%r winner=%s",
+                str(decoded_artist_id or prov_artist_id or ""),
+                is_local,
+                cached,
+                backend,
+                winner,
+            )
+        except Exception:
+            # Telemetry must never break resolution.
+            pass
+        return chosen
 
     def _remember_artist_name(self, artist_id: Any, name: Any) -> None:
         """LRU+TTL write helper for the artist-name cache.
@@ -1386,15 +1448,20 @@ class StreamloaderMAProvider(MusicProviderBase):
                     )
                     if inferred_from_tracks:
                         resolved_name = inferred_from_tracks
-                # Guard stale/ambiguous upstream ids: when we already have a reliable cached artist
-                # name (from search context), do not override it with a conflicting backend name.
+                # Bug 2 stage B: defer the cache-vs-backend bias decision to
+                # _resolve_artist_name_conflict. Local artists keep cache-wins
+                # (library scan is authoritative); non-local ids trust the
+                # backend so a stale cached federated name can't poison the
+                # display indefinitely. Pre-stage-B this branch unconditionally
+                # picked cached_name and let stale entries survive.
                 if (
                     cached_name
                     and resolved_name
                     and not self._looks_like_uri_name(cached_name)
-                    and self._is_artist_name_conflict(cached_name, resolved_name)
                 ):
-                    resolved_name = cached_name
+                    resolved_name = self._resolve_artist_name_conflict(
+                        decoded_artist_id, prov_artist_id, cached_name, resolved_name
+                    )
                 if self._looks_like_uri_name(resolved_name):
                     resolved_name = self._safe_display_name_from_id(
                         cached_name or decoded_artist_id or prov_artist_id,
@@ -1596,7 +1663,18 @@ class StreamloaderMAProvider(MusicProviderBase):
                 candidate_id = album.get("artist_id")
                 candidate_name = album.get("artist_name")
                 if self._is_artist_match(decoded_artist_id, "", candidate_id, None):
-                    if cached_name and candidate_name and self._is_artist_name_conflict(cached_name, str(candidate_name)):
+                    # Bug 2 stage B: id-match wins; we only second-guess by
+                    # name when the artist id is local (library scan is
+                    # authoritative on names). For non-local ids trust the
+                    # id-match and accept the album even if the cached name
+                    # disagrees — preserves federated "various-artists" or
+                    # "feat. X" rows the cached name would have dropped.
+                    if (
+                        cached_name
+                        and candidate_name
+                        and self._is_local_artist_id(decoded_artist_id)
+                        and self._is_artist_name_conflict(cached_name, str(candidate_name))
+                    ):
                         continue
                     strict_matches.append(album)
                 elif cached_name and self._is_artist_match(decoded_artist_id, cached_name, None, candidate_name):
