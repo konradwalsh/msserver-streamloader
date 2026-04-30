@@ -144,6 +144,14 @@ class StreamloaderMAProvider(MusicProviderBase):
 
         base_url = self._config_value("base_url", "http://streamloader:41422").rstrip("/")
         api_key = self._read_api_key()
+        # Self-heal: if storage held the SECURE_STRING placeholder, schedule
+        # an async wipe so the next reload starts clean instead of repeatedly
+        # detecting the same corruption (which is what we're seeing in
+        # production logs at 2026-04-30 17:21 — three consecutive reloads
+        # each surfacing the same warning because MA's UI keeps round-
+        # tripping the placeholder on every save).
+        if getattr(self, "_api_key_storage_corrupted", False):
+            self._schedule_clear_corrupted_api_key()
         try:
             request_timeout = max(2.0, float(self._config_value("request_timeout_seconds", "25")))
         except Exception:
@@ -244,18 +252,75 @@ class StreamloaderMAProvider(MusicProviderBase):
         sentinel ``"this_value_is_encrypted"``. Treat that as no key so we
         don't ship it as a query-string credential (the backend rightly
         rejects it with 401).
+
+        Sets ``self._api_key_storage_corrupted`` so __init__ can schedule
+        a one-shot cleanup of the corrupted blob in MA storage. Without
+        the cleanup the corruption persists across reloads — every config
+        save in MA's UI re-submits the masked placeholder display value,
+        and MA core has no SECURE_STRING_SUBSTITUTE filter on the update
+        path, so storage never escapes the bad state on its own.
         """
         value = self._config_value("api_key", "")
         if not value:
+            self._api_key_storage_corrupted = False
             return None
         if value == _SECURE_STRING_PLACEHOLDER:
             _LOGGER.warning(
                 "Streamloader api_key in config is the SECURE_STRING placeholder "
-                "(prior save was corrupted); treating as unset. "
-                "Re-enter the API key in provider settings to restore auth."
+                "(MA's UI re-submitted the masked display value on save, which "
+                "MA core stored verbatim). Auto-clearing the corrupted entry "
+                "now; please re-enter the API key in provider settings — and "
+                "after pasting, click Save EXACTLY ONCE (additional saves with "
+                "the field still showing the masked placeholder will re-corrupt)."
             )
+            self._api_key_storage_corrupted = True
             return None
+        self._api_key_storage_corrupted = False
         return value
+
+    def _schedule_clear_corrupted_api_key(self) -> None:
+        """Fire-and-forget cleanup of a SECURE_STRING-corrupted api_key blob.
+
+        Called from __init__ when ``_read_api_key`` has flagged
+        ``_api_key_storage_corrupted``. We can't await in __init__, so we
+        schedule the removal as an asyncio task. Failure is logged but
+        non-fatal: the plugin runs without auth (already its current state
+        when the sentinel is present) until the user re-enters the key.
+
+        The cleanup is idempotent — clearing an already-clear entry is a
+        no-op — so worst case of a double-fire is harmless.
+        """
+        mass = getattr(self, "mass", None)
+        config = getattr(mass, "config", None) if mass is not None else None
+        if config is None or not hasattr(config, "remove_provider_config_value"):
+            return
+        instance_id = self.instance_id
+        if not instance_id:
+            return
+
+        async def _clear() -> None:
+            try:
+                await config.remove_provider_config_value(instance_id, "api_key")
+                _LOGGER.info(
+                    "Auto-cleared corrupted SECURE_STRING placeholder from "
+                    "streamloader api_key (instance_id=%s). Storage is now empty; "
+                    "re-enter the key in provider settings to restore auth.",
+                    instance_id,
+                )
+            except Exception as exc:
+                _LOGGER.warning(
+                    "Failed to auto-clear corrupted api_key for instance_id=%s: %s. "
+                    "Click 'Clear saved API key' in provider settings as a manual fallback.",
+                    instance_id,
+                    exc,
+                )
+
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            return
+        if loop.is_running():
+            loop.create_task(_clear())
 
     def _config_bool(self, key: str, default: bool = False) -> bool:
         value = self._config_value(key, "true" if default else "false").strip().lower()
