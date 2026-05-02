@@ -144,14 +144,15 @@ class StreamloaderMAProvider(MusicProviderBase):
 
         base_url = self._config_value("base_url", "http://streamloader:41422").rstrip("/")
         api_key = self._read_api_key()
-        # Self-heal: if storage held the SECURE_STRING placeholder, schedule
-        # an async wipe so the next reload starts clean instead of repeatedly
-        # detecting the same corruption (which is what we're seeing in
-        # production logs at 2026-04-30 17:21 — three consecutive reloads
-        # each surfacing the same warning because MA's UI keeps round-
-        # tripping the placeholder on every save).
-        if getattr(self, "_api_key_storage_corrupted", False):
-            self._schedule_clear_corrupted_api_key()
+        # NOTE (reverted 2026-05-02): the auto-wipe via
+        # _schedule_clear_corrupted_api_key() that used to live here was too
+        # aggressive — any false-positive from _read_api_key would silently
+        # destroy a working api_key on next reload, leading to "MA can't
+        # talk to streamloader, all music searches return 0" with no
+        # obvious cause. Now we only LOG the warning (in _read_api_key);
+        # the user has to deliberately click the "Clear saved API key"
+        # action in provider settings to wipe storage. That preserves the
+        # detection without ever destroying user data.
         try:
             request_timeout = max(2.0, float(self._config_value("request_timeout_seconds", "25")))
         except Exception:
@@ -265,13 +266,18 @@ class StreamloaderMAProvider(MusicProviderBase):
             self._api_key_storage_corrupted = False
             return None
         if value == _SECURE_STRING_PLACEHOLDER:
-            _LOGGER.warning(
-                "Streamloader api_key in config is the SECURE_STRING placeholder "
-                "(MA's UI re-submitted the masked display value on save, which "
-                "MA core stored verbatim). Auto-clearing the corrupted entry "
-                "now; please re-enter the API key in provider settings — and "
-                "after pasting, click Save EXACTLY ONCE (additional saves with "
-                "the field still showing the masked placeholder will re-corrupt)."
+            _LOGGER.error(
+                "Streamloader api_key in config is the SECURE_STRING placeholder. "
+                "All upstream calls will 401 until this is fixed. "
+                "FIX: open Settings -> Providers -> Streamloader, click "
+                "'Clear saved API key', then paste your real key into the "
+                "API key field and click Save EXACTLY ONCE. (Saving twice "
+                "with the field showing the masked placeholder re-corrupts; "
+                "this is a bug in MA core's Config.update which doesn't "
+                "filter SECURE_STRING_SUBSTITUTE values from incoming "
+                "payloads. Reverted 2026-05-02: prior auto-wipe self-heal "
+                "destroyed VALID keys on false-positive reads, so we now "
+                "require manual intervention.)"
             )
             self._api_key_storage_corrupted = True
             return None
@@ -281,14 +287,16 @@ class StreamloaderMAProvider(MusicProviderBase):
     def _schedule_clear_corrupted_api_key(self) -> None:
         """Fire-and-forget cleanup of a SECURE_STRING-corrupted api_key blob.
 
-        Called from __init__ when ``_read_api_key`` has flagged
-        ``_api_key_storage_corrupted``. We can't await in __init__, so we
-        schedule the removal as an asyncio task. Failure is logged but
-        non-fatal: the plugin runs without auth (already its current state
-        when the sentinel is present) until the user re-enters the key.
-
-        The cleanup is idempotent — clearing an already-clear entry is a
-        no-op — so worst case of a double-fire is harmless.
+        DEPRECATED 2026-05-02: no longer called from __init__. Kept as a
+        symbol so any external integration that imported it doesn't break,
+        but the auto-invocation was removed — it had a real-world failure
+        mode where a transient SECURE_STRING_PLACEHOLDER read (during MA
+        startup ordering races, encrypted-blob hiccups, etc.) would
+        permanently destroy the user's valid key on the next reload. The
+        operator now has to deliberately click the existing "Clear saved
+        API key" action in provider settings, which calls the same
+        underlying ``mass.config.remove_provider_config_value``. See
+        ``__init__`` and ``_read_api_key`` for the new contract.
         """
         mass = getattr(self, "mass", None)
         config = getattr(mass, "config", None) if mass is not None else None
